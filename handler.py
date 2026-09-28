@@ -277,8 +277,16 @@ def handler(event):
     up = get_upsampler(model, tile=tile, half=not inp.get("fp32", False))
     load_time = round(time.time() - t_load, 2)
 
-    results = []
-    for item in videos:
+    from concurrent.futures import ThreadPoolExecutor
+
+    info = cuda_info()
+    t_load = time.time()
+    up = get_upsampler(model, tile=tile, half=not inp.get("fp32", False))
+    load_time = round(time.time() - t_load, 2)
+    frame_batch = inp.get("frame_batch", 4)
+    concurrency = max(1, int(inp.get("concurrency", 1)))
+
+    def process_one(item):
         url = item["url"] if isinstance(item, dict) else item
         key = item.get("key") if isinstance(item, dict) else None
         base = os.path.splitext(os.path.basename(url.split("?")[0]))[0]
@@ -294,7 +302,7 @@ def handler(event):
                 download(url, src)
                 dl_time = round(time.time() - td0, 2)
                 meta = upscale_video(src, dst, up, outscale, vcodec=vcodec, preset=preset,
-                                 batch=inp.get("frame_batch", 4))
+                                     batch=frame_batch)
                 s3.upload_file(dst, bucket, key, Config=tc,
                                ExtraArgs={"ContentType": "video/mp4"})
             entry.update(meta)
@@ -304,13 +312,21 @@ def handler(event):
         except Exception as e:
             entry["error"] = f"{type(e).__name__}: {e}"
             entry["traceback"] = traceback.format_exc()[-800:]
-        results.append(entry)
+        return entry
+
+    if concurrency == 1:
+        results = [process_one(it) for it in videos]
+    else:
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            results = list(ex.map(process_one, videos))
 
     return {
         "count": len(results),
         "ok": sum(1 for r in results if "error" not in r),
         "model": model,
         "outscale": outscale,
+        "concurrency": concurrency,
+        "frame_batch": frame_batch,
         "runtime": info,
         "model_load_time": load_time,
         "results": results,
