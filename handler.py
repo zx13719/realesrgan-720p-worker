@@ -130,24 +130,23 @@ def ffprobe(path):
 
 
 def enhance_batch(frames, upsampler, outscale):
-    """Run the ESR model on a batch of BGR uint8 frames (replaces enhance() for throughput)."""
-    arr = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 for f in frames])
-    t = torch.from_numpy(arr).permute(0, 3, 1, 2).to(upsampler.device)
-    if upsampler.half:
-        t = t.half()
+    """Run the ESR model on a batch of BGR uint8 frames, doing the downscale on GPU."""
+    import torch.nn.functional as F
+
+    arr = np.stack(frames)  # N,H,W,3 BGR uint8
+    t = torch.from_numpy(arr).to(upsampler.device, non_blocking=True)
+    t = t.permute(0, 3, 1, 2).flip(1).contiguous()  # N,3,H,W (RGB)
+    t = (t.half() if upsampler.half else t.float()).div_(255.0)
     with torch.no_grad():
         out = upsampler.model(t)
-    out = out.float().clamp_(0, 1).cpu().numpy()
-    h, w = frames[0].shape[:2]
-    res = []
-    for i in range(out.shape[0]):
-        o = np.transpose(out[i][[2, 1, 0]], (1, 2, 0))
-        o = (o * 255.0).round().astype(np.uint8)
-        if outscale != float(upsampler.scale):
-            o = cv2.resize(o, (int(w * outscale), int(h * outscale)),
-                           interpolation=cv2.INTER_LANCZOS4)
-        res.append(o)
-    return res
+    out = out.float().clamp_(0, 1)
+    if outscale != float(upsampler.scale):
+        h, w = frames[0].shape[:2]
+        out = F.interpolate(out, size=(int(h * outscale), int(w * outscale)),
+                            mode="bicubic", align_corners=False).clamp_(0, 1)
+    out = (out * 255.0).round_().to(torch.uint8).permute(0, 2, 3, 1)  # N,H,W,3 RGB
+    arr_out = out.cpu().numpy()
+    return [np.ascontiguousarray(o[:, :, ::-1]) for o in arr_out]  # RGB -> BGR
 
 
 def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None, batch=4):
