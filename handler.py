@@ -9,12 +9,10 @@ Input (event["input"]):
   bucket:            override bucket (default env R2_BUCKET)
   tile:              int, 0 = no tiling (default 0)
   fp32:              bool, use fp32 (default false = fp16)
+  preset:            x264 preset when not using NVENC (default env X264_PRESET or "veryfast")
+  vcodec:            "auto" | "libx264" | "nvenc"  (default "auto")
 
-Env (endpoint env):
-  R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_BASE_URL
-
-Output:
-  {"count": n, "results": [{"input","key","url","width","height","fps","duration","frames"}]}
+Env: R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_BASE_URL
 """
 import os
 import json
@@ -26,6 +24,8 @@ import urllib.request
 
 import numpy as np
 import torch
+
+torch.backends.cudnn.benchmark = True
 
 MODELS = {
     "realesr-general-x4v3": {
@@ -41,6 +41,34 @@ MODELS = {
 }
 
 _UPSAMPLERS = {}
+_NVENC = None
+
+
+def cuda_info():
+    avail = torch.cuda.is_available()
+    return {
+        "device": "cuda" if avail else "cpu",
+        "cuda_available": avail,
+        "gpu": torch.cuda.get_device_name(0) if avail else None,
+        "capability": torch.cuda.get_device_capability(0) if avail else None,
+        "arch_list": torch.cuda.get_arch_list() if avail else [],
+    }
+
+
+def nvenc_available():
+    global _NVENC
+    if _NVENC is None:
+        try:
+            r = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                 "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+                 "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, timeout=40,
+            )
+            _NVENC = (r.returncode == 0)
+        except Exception:
+            _NVENC = False
+    return _NVENC
 
 
 def _build_model(name):
@@ -63,7 +91,9 @@ def get_upsampler(name, tile=0, half=True):
     from realesrgan import RealESRGANer
 
     cfg = MODELS[name]
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    info = cuda_info()
+    if info["device"] != "cuda":
+        raise RuntimeError(f"CUDA not available in worker: {info}")
     up = RealESRGANer(
         scale=cfg["netscale"],
         model_path=cfg["path"],
@@ -71,8 +101,8 @@ def get_upsampler(name, tile=0, half=True):
         tile=tile,
         tile_pad=10,
         pre_pad=0,
-        half=(half and device == "cuda"),
-        device=device,
+        half=half,
+        device="cuda",
     )
     _UPSAMPLERS[key] = up
     return up
@@ -97,7 +127,7 @@ def ffprobe(path):
     return st["width"], st["height"], fps, duration, has_audio
 
 
-def upscale_video(src, dst, upsampler, outscale):
+def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None):
     w, h, fps, duration, has_audio = ffprobe(src)
     out_w = int(w * outscale); out_w -= out_w % 2
     out_h = int(h * outscale); out_h -= out_h % 2
@@ -106,16 +136,27 @@ def upscale_video(src, dst, upsampler, outscale):
         ["ffmpeg", "-v", "error", "-i", src, "-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"],
         stdout=subprocess.PIPE,
     )
+
+    use_nvenc = (vcodec == "nvenc") or (vcodec == "auto" and nvenc_available())
+    if use_nvenc:
+        enc = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19", "-pix_fmt", "yuv420p"]
+        codec = "h264_nvenc"
+    else:
+        enc = ["-c:v", "libx264", "-preset", preset or os.environ.get("X264_PRESET", "veryfast"),
+               "-crf", "17", "-pix_fmt", "yuv420p"]
+        codec = "libx264"
+
     wcmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "pipe:0"]
     if has_audio:
         wcmd += ["-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy", "-shortest"]
     else:
         wcmd += ["-map", "0:v:0"]
-    wcmd += ["-c:v", "libx264", "-crf", "17", "-preset", "medium", "-pix_fmt", "yuv420p", dst]
+    wcmd += enc + [dst]
     writer = subprocess.Popen(wcmd, stdin=subprocess.PIPE)
 
     frames = 0
+    enhance_time = 0.0
     frame_bytes = w * h * 3
     try:
         while True:
@@ -123,7 +164,9 @@ def upscale_video(src, dst, upsampler, outscale):
             if len(buf) < frame_bytes:
                 break
             frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
+            t0 = time.time()
             out, _ = upsampler.enhance(frame, outscale=outscale)
+            enhance_time += time.time() - t0
             out = out[:out_h, :out_w]
             writer.stdin.write(out.astype(np.uint8).tobytes())
             frames += 1
@@ -136,12 +179,13 @@ def upscale_video(src, dst, upsampler, outscale):
         reader.stdout.close()
         reader.wait()
 
-    return {"width": out_w, "height": out_h, "fps": fps,
-            "duration": duration, "frames": frames}
+    return {"width": out_w, "height": out_h, "fps": fps, "duration": duration,
+            "frames": frames, "vcodec": codec,
+            "enhance_time": round(enhance_time, 2),
+            "enhance_fps": round(frames / enhance_time, 2) if enhance_time > 0 else None}
 
 
 def download(url, dst):
-    """Download with a browser-like UA (Cloudflare r2.dev blocks Python-urllib)."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; RunPod-ESR/1.0)"}
     last = None
     for _ in range(4):
@@ -183,6 +227,8 @@ def handler(event):
         return {"error": f"unknown model {model}; choose {list(MODELS)}"}
     outscale = float(inp.get("outscale", 1.5))
     tile = int(inp.get("tile", 0))
+    vcodec = inp.get("vcodec", "auto")
+    preset = inp.get("preset")
     prefix = inp.get("prefix") or ""
     bucket = inp.get("bucket") or os.environ["R2_BUCKET"]
     public_base = (inp.get("public_base") or os.environ.get("R2_PUBLIC_BASE_URL", "")).rstrip("/")
@@ -190,7 +236,11 @@ def handler(event):
     from boto3.s3.transfer import TransferConfig
     s3 = s3_client()
     tc = TransferConfig(max_concurrency=16)
+
+    info = cuda_info()
+    t_load = time.time()
     up = get_upsampler(model, tile=tile, half=not inp.get("fp32", False))
+    load_time = round(time.time() - t_load, 2)
 
     results = []
     for item in videos:
@@ -205,11 +255,14 @@ def handler(event):
             with tempfile.TemporaryDirectory() as td:
                 src = os.path.join(td, "in.mp4")
                 dst = os.path.join(td, "out.mp4")
+                td0 = time.time()
                 download(url, src)
-                meta = upscale_video(src, dst, up, outscale)
+                dl_time = round(time.time() - td0, 2)
+                meta = upscale_video(src, dst, up, outscale, vcodec=vcodec, preset=preset)
                 s3.upload_file(dst, bucket, key, Config=tc,
                                ExtraArgs={"ContentType": "video/mp4"})
             entry.update(meta)
+            entry["download_time"] = dl_time
             entry["url"] = f"{public_base}/{key}"
             entry["elapsed"] = round(time.time() - t0, 2)
         except Exception as e:
@@ -222,6 +275,8 @@ def handler(event):
         "ok": sum(1 for r in results if "error" not in r),
         "model": model,
         "outscale": outscale,
+        "runtime": info,
+        "model_load_time": load_time,
         "results": results,
     }
 
