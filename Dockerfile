@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip3 install --index-url https://download.pytorch.org/whl/cu128 \
-        torch==2.6.0 torchvision==0.21.0
+        torch==2.7.0 torchvision==0.22.0
 
 RUN pip3 install \
         "numpy<2" basicsr realesrgan opencv-python-headless boto3 runpod
