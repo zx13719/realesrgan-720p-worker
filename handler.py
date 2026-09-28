@@ -25,6 +25,8 @@ import urllib.request
 import numpy as np
 import torch
 
+import cv2
+
 torch.backends.cudnn.benchmark = True
 
 MODELS = {
@@ -127,7 +129,28 @@ def ffprobe(path):
     return st["width"], st["height"], fps, duration, has_audio
 
 
-def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None):
+def enhance_batch(frames, upsampler, outscale):
+    """Run the ESR model on a batch of BGR uint8 frames (replaces enhance() for throughput)."""
+    arr = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0 for f in frames])
+    t = torch.from_numpy(arr).permute(0, 3, 1, 2).to(upsampler.device)
+    if upsampler.half:
+        t = t.half()
+    with torch.no_grad():
+        out = upsampler.model(t)
+    out = out.float().clamp_(0, 1).cpu().numpy()
+    h, w = frames[0].shape[:2]
+    res = []
+    for i in range(out.shape[0]):
+        o = np.transpose(out[i][[2, 1, 0]], (1, 2, 0))
+        o = (o * 255.0).round().astype(np.uint8)
+        if outscale != float(upsampler.scale):
+            o = cv2.resize(o, (int(w * outscale), int(h * outscale)),
+                           interpolation=cv2.INTER_LANCZOS4)
+        res.append(o)
+    return res
+
+
+def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None, batch=4):
     w, h, fps, duration, has_audio = ffprobe(src)
     out_w = int(w * outscale); out_w -= out_w % 2
     out_h = int(h * outscale); out_h -= out_h % 2
@@ -158,18 +181,30 @@ def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None):
     frames = 0
     enhance_time = 0.0
     frame_bytes = w * h * 3
+    frame_batch = max(1, int(batch))
+    pending = []
+
+    def flush(pending):
+        nonlocal frames, enhance_time
+        if not pending:
+            return
+        t0 = time.time()
+        outs = enhance_batch(pending, upsampler, outscale)
+        enhance_time += time.time() - t0
+        for o in outs:
+            writer.stdin.write(o[:out_h, :out_w].tobytes())
+            frames += 1
+
     try:
         while True:
             buf = reader.stdout.read(frame_bytes)
             if len(buf) < frame_bytes:
                 break
-            frame = np.frombuffer(buf, np.uint8).reshape(h, w, 3)
-            t0 = time.time()
-            out, _ = upsampler.enhance(frame, outscale=outscale)
-            enhance_time += time.time() - t0
-            out = out[:out_h, :out_w]
-            writer.stdin.write(out.astype(np.uint8).tobytes())
-            frames += 1
+            pending.append(np.frombuffer(buf, np.uint8).reshape(h, w, 3))
+            if len(pending) >= frame_batch:
+                flush(pending)
+                pending = []
+        flush(pending)
     finally:
         try:
             writer.stdin.close()
@@ -180,7 +215,7 @@ def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None):
         reader.wait()
 
     return {"width": out_w, "height": out_h, "fps": fps, "duration": duration,
-            "frames": frames, "vcodec": codec,
+            "frames": frames, "vcodec": codec, "frame_batch": frame_batch,
             "enhance_time": round(enhance_time, 2),
             "enhance_fps": round(frames / enhance_time, 2) if enhance_time > 0 else None}
 
@@ -258,7 +293,8 @@ def handler(event):
                 td0 = time.time()
                 download(url, src)
                 dl_time = round(time.time() - td0, 2)
-                meta = upscale_video(src, dst, up, outscale, vcodec=vcodec, preset=preset)
+                meta = upscale_video(src, dst, up, outscale, vcodec=vcodec, preset=preset,
+                                 batch=inp.get("frame_batch", 4))
                 s3.upload_file(dst, bucket, key, Config=tc,
                                ExtraArgs={"ContentType": "video/mp4"})
             entry.update(meta)
