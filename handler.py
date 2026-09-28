@@ -140,6 +140,27 @@ def upscale_video(src, dst, upsampler, outscale):
             "duration": duration, "frames": frames}
 
 
+def download(url, dst):
+    """Download with a browser-like UA (Cloudflare r2.dev blocks Python-urllib)."""
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; RunPod-ESR/1.0)"}
+    last = None
+    for _ in range(4):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=180) as r, open(dst, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            if os.path.getsize(dst) > 0:
+                return
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(2)
+    raise last if last else RuntimeError("download failed")
+
+
 def s3_client():
     import boto3
     return boto3.client(
@@ -184,7 +205,7 @@ def handler(event):
             with tempfile.TemporaryDirectory() as td:
                 src = os.path.join(td, "in.mp4")
                 dst = os.path.join(td, "out.mp4")
-                urllib.request.urlretrieve(url, src)
+                download(url, src)
                 meta = upscale_video(src, dst, up, outscale)
                 s3.upload_file(dst, bucket, key, Config=tc,
                                ExtraArgs={"ContentType": "video/mp4"})
