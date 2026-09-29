@@ -133,7 +133,7 @@ def count_frames(path):
 
 def enhance_batch(frames, model, outscale, scale, half=True, channels_last=True):
     """Run the ESR model on a batch of BGR uint8 frames, downscale on GPU. Returns BGR uint8."""
-    device = next(model.parameters()).device
+    device = next(getattr(model, "model", model).parameters()).device
     arr = np.stack(frames)[..., ::-1]  # BGR -> RGB
     t = torch.from_numpy(arr).permute(0, 3, 1, 2)
     if channels_last:
