@@ -134,21 +134,19 @@ def count_frames(path):
 def enhance_batch(frames, model, outscale, scale, half=True, channels_last=True):
     """Run the ESR model on a batch of BGR uint8 frames, downscale on GPU. Returns BGR uint8."""
     device = next(getattr(model, "model", model).parameters()).device
-    arr = np.stack(frames)[..., ::-1]  # BGR -> RGB
-    t = torch.from_numpy(arr).permute(0, 3, 1, 2)
-    if channels_last:
-        t = t.contiguous(memory_format=torch.channels_last)
-    t = t.to(device, non_blocking=True)
+    arr = np.stack(frames)  # N,H,W,3 BGR (contiguous)
+    t = torch.from_numpy(arr).to(device, non_blocking=True).permute(0, 3, 1, 2).flip(1)  # RGB
+    t = t.contiguous(memory_format=torch.channels_last) if channels_last else t.contiguous()
     t = (t.half() if half else t.float()).div_(255.0)
     with torch.inference_mode():
         out = model(t)
-    out = out.float().clamp_(0, 1)
-    if abs(outscale - float(scale)) > 1e-6:
-        h, w = frames[0].shape[:2]
-        out = F.interpolate(out, size=(int(h * outscale), int(w * outscale)),
-                            mode="bicubic", align_corners=False).clamp_(0, 1)
-    out = (out * 255.0).round_().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
-    return [np.ascontiguousarray(o[:, :, ::-1]) for o in out]
+        out = out.float().clamp(0, 1)
+        if abs(outscale - float(scale)) > 1e-6:
+            h, w = frames[0].shape[:2]
+            out = F.interpolate(out, size=(int(h * outscale), int(w * outscale)),
+                                mode="bicubic", align_corners=False).clamp(0, 1)
+        arr_out = (out * 255.0).round().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+    return [np.ascontiguousarray(o[:, :, ::-1]) for o in arr_out]
 
 
 def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, batch=8,
