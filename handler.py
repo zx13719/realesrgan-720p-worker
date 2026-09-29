@@ -91,9 +91,17 @@ def get_model(name, half=True, channels_last=True, compile_model=False):
     model = model.half() if half else model.float()
     model = model.eval()
     if channels_last:
-        model = model.to(memory_format=torch.channels_last)
+        # spandrel's descriptor overrides .to() and rejects memory_format;
+        # apply it on the wrapped nn.Module instead.
+        try:
+            getattr(model, "model", model).to(memory_format=torch.channels_last)
+        except Exception:
+            pass
     if compile_model:
-        model = torch.compile(model)
+        try:
+            model = torch.compile(model)
+        except Exception:
+            pass
     _MODELS[key] = (model, scale)
     return model, scale
 
