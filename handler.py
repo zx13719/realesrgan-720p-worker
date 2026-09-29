@@ -99,7 +99,7 @@ def get_model(name, half=True, channels_last=True, compile_model=False):
 
 
 def ffprobe(path):
-    """Single ffprobe call: width, height, fps, duration, has_audio."""
+    """Single ffprobe call: width, height, fps, duration, frames, has_audio."""
     out = subprocess.check_output([
         "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path,
     ])
@@ -107,8 +107,20 @@ def ffprobe(path):
     st = next(s for s in d["streams"] if s["codec_type"] == "video")
     num, den = st["r_frame_rate"].split("/")
     fps = float(num) / float(den)
+    duration = float(d["format"]["duration"])
+    nb = st.get("nb_frames")
+    frames = int(nb) if nb and nb not in ("N/A", "0") else round(duration * fps)
     has_audio = any(s["codec_type"] == "audio" for s in d["streams"])
-    return st["width"], st["height"], fps, float(d["format"]["duration"]), has_audio
+    return st["width"], st["height"], fps, duration, frames, has_audio
+
+
+def count_frames(path):
+    """Exact decoded video frame count (catches silent truncation)."""
+    out = subprocess.check_output([
+        "ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+        "-show_entries", "stream=nb_read_frames", "-of", "json", path,
+    ])
+    return int(json.loads(out)["streams"][0]["nb_read_frames"])
 
 
 def enhance_batch(frames, model, outscale, scale, half=True, channels_last=True):
@@ -134,7 +146,7 @@ def enhance_batch(frames, model, outscale, scale, half=True, channels_last=True)
 def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, batch=8,
                   half=True, channels_last=True):
     """Decode -> (prefetch) -> GPU enhance -> encode, muxing the original audio."""
-    w, h, fps, duration, has_audio = ffprobe(src)
+    w, h, fps, duration, expected_frames, has_audio = ffprobe(src)
     out_w = int(w * outscale); out_w -= out_w % 2
     out_h = int(h * outscale); out_h -= out_h % 2
 
@@ -222,8 +234,16 @@ def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, 
     if producer_error:
         raise producer_error[0]
 
+    # Hard guard: never ship a silently truncated video (the v9 -shortest regression).
+    actual = count_frames(dst)
+    if actual != expected_frames:
+        raise RuntimeError(
+            f"frame mismatch: source={expected_frames} output={actual} "
+            f"({expected_frames - actual} lost)")
+
     return {"width": out_w, "height": out_h, "fps": fps, "duration": duration,
-            "frames": frames, "vcodec": codec, "frame_batch": frame_batch,
+            "frames": frames, "verified_frames": actual,
+            "vcodec": codec, "frame_batch": frame_batch,
             "enhance_time": round(enhance_time, 2),
             "enhance_fps": round(frames / enhance_time, 2) if enhance_time > 0 else None}
 

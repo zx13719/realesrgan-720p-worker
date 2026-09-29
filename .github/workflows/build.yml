@@ -28,7 +28,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:v10
+            ghcr.io/${{ github.repository }}:v11
 
       - name: Make package public
         continue-on-error: true
