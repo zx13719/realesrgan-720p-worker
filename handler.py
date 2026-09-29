@@ -1,21 +1,27 @@
-"""RunPod Serverless worker: Real-ESRGAN video upscaling (480p -> 720p).
+"""RunPod Serverless worker: Real-ESRGAN video upscaling (e.g. 480p -> 720p).
 
 Input (event["input"]):
   videos:            list[str] | list[{"url": str, "key": str?}]   required
-  model:             "realesr-general-x4v3" | "RealESRGAN_x4plus"  (default realesr-general-x4v3)
+  model:             "realesr-general-x4v3" | "RealESRGAN_x2plus" | "RealESRGAN_x4plus"
+                     (default realesr-general-x4v3; x2plus is best when outscale~1.5)
   outscale:          float, final scale vs input (default 1.5)
   prefix:            R2 key prefix for outputs (default "")
   public_base:       public URL base for returned links (default env R2_PUBLIC_BASE_URL)
   bucket:            override bucket (default env R2_BUCKET)
-  tile:              int, 0 = no tiling (default 0)
   fp32:              bool, use fp32 (default false = fp16)
+  channels_last:     bool, NHWC memory format (default true)
+  frame_batch:       int, frames per GPU forward (default env ESR_FRAME_BATCH or 8)
+  concurrency:       int, videos processed in parallel (default env ESR_CONCURRENCY or 1)
   preset:            x264 preset when not using NVENC (default env X264_PRESET or "veryfast")
   vcodec:            "auto" | "libx264" | "nvenc"  (default "auto")
+  compile:           bool, torch.compile the model (default false; one-off warm-up cost)
 
 Env: R2_ENDPOINT_URL, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET, R2_PUBLIC_BASE_URL
 """
 import os
 import json
+import queue
+import threading
 import time
 import subprocess
 import tempfile
@@ -24,25 +30,17 @@ import urllib.request
 
 import numpy as np
 import torch
-
-import cv2
+import torch.nn.functional as F
 
 torch.backends.cudnn.benchmark = True
 
 MODELS = {
-    "realesr-general-x4v3": {
-        "path": "/models/realesr-general-x4v3.pth",
-        "netscale": 4,
-        "arch": ("srvgg", 32),
-    },
-    "RealESRGAN_x4plus": {
-        "path": "/models/RealESRGAN_x4plus.pth",
-        "netscale": 4,
-        "arch": ("rrdb", 23),
-    },
+    "realesr-general-x4v3": "/models/realesr-general-x4v3.pth",
+    "RealESRGAN_x2plus": "/models/RealESRGAN_x2plus.pth",
+    "RealESRGAN_x4plus": "/models/RealESRGAN_x4plus.pth",
 }
 
-_UPSAMPLERS = {}
+_MODELS = {}
 _NVENC = None
 
 
@@ -58,6 +56,7 @@ def cuda_info():
 
 
 def nvenc_available():
+    """Probe once whether this build/driver exposes h264_nvenc."""
     global _NVENC
     if _NVENC is None:
         try:
@@ -73,83 +72,68 @@ def nvenc_available():
     return _NVENC
 
 
-def _build_model(name):
-    from basicsr.archs.srvgg_arch import SRVGGNetCompact
-    from basicsr.archs.rrdbnet_arch import RRDBNet
+def get_model(name, half=True, channels_last=True, compile_model=False):
+    """Load a .pth via spandrel (no basicsr/realesrgan needed).
 
-    cfg = MODELS[name]
-    kind, n = cfg["arch"]
-    if kind == "srvgg":
-        return SRVGGNetCompact(num_in_ch=3, num_out_ch=3, num_feat=64, num_conv=n,
-                               upscale=4, act_type="prelu")
-    return RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=n,
-                   num_grow_ch=32, scale=4)
+    Returns (model, scale). Cached per config.
+    """
+    key = (name, half, channels_last, compile_model)
+    if key in _MODELS:
+        return _MODELS[key]
+    from spandrel import ModelLoader
 
-
-def get_upsampler(name, tile=0, half=True):
-    key = (name, tile, half)
-    if key in _UPSAMPLERS:
-        return _UPSAMPLERS[key]
-    from realesrgan import RealESRGANer
-
-    cfg = MODELS[name]
     info = cuda_info()
     if info["device"] != "cuda":
         raise RuntimeError(f"CUDA not available in worker: {info}")
-    up = RealESRGANer(
-        scale=cfg["netscale"],
-        model_path=cfg["path"],
-        model=_build_model(name),
-        tile=tile,
-        tile_pad=10,
-        pre_pad=0,
-        half=half,
-        device="cuda",
-    )
-    _UPSAMPLERS[key] = up
-    return up
+    desc = ModelLoader().load_from_file(MODELS[name])
+    scale = float(desc.scale)
+    model = desc.cuda()
+    model = model.half() if half else model.float()
+    model = model.eval()
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    if compile_model:
+        model = torch.compile(model)
+    _MODELS[key] = (model, scale)
+    return model, scale
 
 
 def ffprobe(path):
+    """Single ffprobe call: width, height, fps, duration, has_audio."""
     out = subprocess.check_output([
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate",
-        "-show_entries", "format=duration", "-of", "json", path,
+        "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", path,
     ])
     d = json.loads(out)
-    st = d["streams"][0]
+    st = next(s for s in d["streams"] if s["codec_type"] == "video")
     num, den = st["r_frame_rate"].split("/")
     fps = float(num) / float(den)
-    duration = float(d["format"]["duration"])
-    has_audio = bool(subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "a",
-         "-show_entries", "stream=index", "-of", "csv=p=0", path],
-        capture_output=True,
-    ).stdout.strip())
-    return st["width"], st["height"], fps, duration, has_audio
+    has_audio = any(s["codec_type"] == "audio" for s in d["streams"])
+    return st["width"], st["height"], fps, float(d["format"]["duration"]), has_audio
 
 
-def enhance_batch(frames, upsampler, outscale):
-    """Run the ESR model on a batch of BGR uint8 frames, doing the downscale on GPU."""
-    import torch.nn.functional as F
-
-    arr = np.stack(frames)  # N,H,W,3 BGR uint8
-    t = torch.from_numpy(arr).to(upsampler.device, non_blocking=True)
-    t = t.permute(0, 3, 1, 2).flip(1).contiguous()  # N,3,H,W (RGB)
-    t = (t.half() if upsampler.half else t.float()).div_(255.0)
-    with torch.no_grad():
-        out = upsampler.model(t)
+def enhance_batch(frames, model, outscale, scale, half=True, channels_last=True):
+    """Run the ESR model on a batch of BGR uint8 frames, downscale on GPU. Returns BGR uint8."""
+    device = next(model.parameters()).device
+    arr = np.stack(frames)[..., ::-1]  # BGR -> RGB
+    t = torch.from_numpy(arr).permute(0, 3, 1, 2)
+    if channels_last:
+        t = t.contiguous(memory_format=torch.channels_last)
+    t = t.to(device, non_blocking=True)
+    t = (t.half() if half else t.float()).div_(255.0)
+    with torch.inference_mode():
+        out = model(t)
     out = out.float().clamp_(0, 1)
-    if outscale != float(upsampler.scale):
+    if abs(outscale - float(scale)) > 1e-6:
         h, w = frames[0].shape[:2]
         out = F.interpolate(out, size=(int(h * outscale), int(w * outscale)),
                             mode="bicubic", align_corners=False).clamp_(0, 1)
-    out = (out * 255.0).round_().to(torch.uint8).permute(0, 2, 3, 1)  # N,H,W,3 RGB
-    arr_out = out.cpu().numpy()
-    return [np.ascontiguousarray(o[:, :, ::-1]) for o in arr_out]  # RGB -> BGR
+    out = (out * 255.0).round_().to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+    return [np.ascontiguousarray(o[:, :, ::-1]) for o in out]
 
 
-def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None, batch=4):
+def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, batch=8,
+                  half=True, channels_last=True):
+    """Decode -> (prefetch) -> GPU enhance -> encode, muxing the original audio."""
     w, h, fps, duration, has_audio = ffprobe(src)
     out_w = int(w * outscale); out_w -= out_w % 2
     out_h = int(h * outscale); out_h -= out_h % 2
@@ -171,40 +155,63 @@ def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None, bat
     wcmd = ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "pipe:0"]
     if has_audio:
-        wcmd += ["-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy", "-shortest"]
+        # NOTE: no -shortest here; it truncates trailing video frames when audio is copied.
+        wcmd += ["-i", src, "-map", "0:v:0", "-map", "1:a:0", "-c:a", "copy"]
     else:
         wcmd += ["-map", "0:v:0"]
-    wcmd += enc + [dst]
+    wcmd += enc + ["-movflags", "+faststart", dst]
     writer = subprocess.Popen(wcmd, stdin=subprocess.PIPE)
+
+    frame_bytes = w * h * 3
+    frame_batch = max(1, int(batch))
+
+    # Decode runs in a producer thread so the GPU never waits on the ffmpeg pipe.
+    q = queue.Queue(maxsize=max(2, frame_batch * 2))
+    producer_error = []
+
+    def produce():
+        try:
+            while True:
+                buf = reader.stdout.read(frame_bytes)
+                if len(buf) < frame_bytes:
+                    break
+                q.put(np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy())
+        except Exception as e:  # noqa: BLE001
+            producer_error.append(e)
+        finally:
+            q.put(None)
+
+    th = threading.Thread(target=produce, daemon=True)
+    th.start()
 
     frames = 0
     enhance_time = 0.0
-    frame_bytes = w * h * 3
-    frame_batch = max(1, int(batch))
     pending = []
 
-    def flush(pending):
+    def flush():
         nonlocal frames, enhance_time
         if not pending:
             return
         t0 = time.time()
-        outs = enhance_batch(pending, upsampler, outscale)
+        outs = enhance_batch(pending, model, outscale, scale, half=half,
+                             channels_last=channels_last)
         enhance_time += time.time() - t0
         for o in outs:
             writer.stdin.write(o[:out_h, :out_w].tobytes())
             frames += 1
+        pending.clear()
 
     try:
         while True:
-            buf = reader.stdout.read(frame_bytes)
-            if len(buf) < frame_bytes:
+            item = q.get()
+            if item is None:
                 break
-            pending.append(np.frombuffer(buf, np.uint8).reshape(h, w, 3))
+            pending.append(item)
             if len(pending) >= frame_batch:
-                flush(pending)
-                pending = []
-        flush(pending)
+                flush()
+        flush()
     finally:
+        th.join(timeout=5)
         try:
             writer.stdin.close()
         except Exception:
@@ -212,6 +219,8 @@ def upscale_video(src, dst, upsampler, outscale, vcodec="auto", preset=None, bat
         writer.wait()
         reader.stdout.close()
         reader.wait()
+    if producer_error:
+        raise producer_error[0]
 
     return {"width": out_w, "height": out_h, "fps": fps, "duration": duration,
             "frames": frames, "vcodec": codec, "frame_batch": frame_batch,
@@ -256,16 +265,22 @@ def handler(event):
     if not videos:
         return {"error": "no videos provided"}
 
-    model = inp.get("model", "realesr-general-x4v3")
-    if model not in MODELS:
-        return {"error": f"unknown model {model}; choose {list(MODELS)}"}
+    model_name = inp.get("model", "realesr-general-x4v3")
+    if model_name not in MODELS:
+        return {"error": f"unknown model {model_name}; choose {list(MODELS)}"}
     outscale = float(inp.get("outscale", 1.5))
-    tile = int(inp.get("tile", 0))
+    half = not inp.get("fp32", False)
+    channels_last = bool(inp.get("channels_last", True))
+    compile_model = bool(inp.get("compile", False))
     vcodec = inp.get("vcodec", "auto")
     preset = inp.get("preset")
     prefix = inp.get("prefix") or ""
     bucket = inp.get("bucket") or os.environ["R2_BUCKET"]
     public_base = (inp.get("public_base") or os.environ.get("R2_PUBLIC_BASE_URL", "")).rstrip("/")
+    frame_batch = int(inp.get("frame_batch", os.environ.get("ESR_FRAME_BATCH", 8)))
+    concurrency = max(1, int(inp.get("concurrency", os.environ.get("ESR_CONCURRENCY", 1))))
+
+    from concurrent.futures import ThreadPoolExecutor
 
     from boto3.s3.transfer import TransferConfig
     s3 = s3_client()
@@ -273,17 +288,9 @@ def handler(event):
 
     info = cuda_info()
     t_load = time.time()
-    up = get_upsampler(model, tile=tile, half=not inp.get("fp32", False))
+    model, model_scale = get_model(model_name, half=half, channels_last=channels_last,
+                                   compile_model=compile_model)
     load_time = round(time.time() - t_load, 2)
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    info = cuda_info()
-    t_load = time.time()
-    up = get_upsampler(model, tile=tile, half=not inp.get("fp32", False))
-    load_time = round(time.time() - t_load, 2)
-    frame_batch = inp.get("frame_batch", 4)
-    concurrency = max(1, int(inp.get("concurrency", 1)))
 
     def process_one(item):
         url = item["url"] if isinstance(item, dict) else item
@@ -300,15 +307,16 @@ def handler(event):
                 td0 = time.time()
                 download(url, src)
                 dl_time = round(time.time() - td0, 2)
-                meta = upscale_video(src, dst, up, outscale, vcodec=vcodec, preset=preset,
-                                     batch=frame_batch)
+                meta = upscale_video(src, dst, model, outscale, model_scale, vcodec=vcodec,
+                                     preset=preset, batch=frame_batch, half=half,
+                                     channels_last=channels_last)
                 s3.upload_file(dst, bucket, key, Config=tc,
                                ExtraArgs={"ContentType": "video/mp4"})
             entry.update(meta)
             entry["download_time"] = dl_time
             entry["url"] = f"{public_base}/{key}"
             entry["elapsed"] = round(time.time() - t0, 2)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             entry["error"] = f"{type(e).__name__}: {e}"
             entry["traceback"] = traceback.format_exc()[-800:]
         return entry
@@ -322,10 +330,11 @@ def handler(event):
     return {
         "count": len(results),
         "ok": sum(1 for r in results if "error" not in r),
-        "model": model,
+        "model": model_name,
         "outscale": outscale,
         "concurrency": concurrency,
         "frame_batch": frame_batch,
+        "channels_last": channels_last,
         "runtime": info,
         "model_load_time": load_time,
         "results": results,
