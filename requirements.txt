@@ -1,0 +1,5 @@
+# Direct dependency versions from the last successful image build.
+numpy==1.26.4
+spandrel==0.4.2
+boto3==1.43.104
+runpod==1.12.0

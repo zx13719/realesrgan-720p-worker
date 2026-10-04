@@ -58,3 +58,16 @@ Response:
 ```json
 {"count":2,"ok":2,"results":[{"input":"...","key":"...","url":"...","width":720,"height":1280,"fps":30,"duration":13.1,"frames":392,"enhance_fps":11.2,"elapsed":21.4}]}
 ```
+
+## Reliability (v16)
+
+The worker checks decoder/encoder exit status, compares exact decoded source/output
+frame counts, fully decodes the output before upload, and cleans up both child
+processes if inference or encoding fails. Per-item errors still require the caller
+to reject the result even when RunPod reports the outer job as COMPLETED.
+
+CI now runs real ffmpeg pipe/cleanup regression tests using a CPU inference stand-in,
+builds PR images without publishing, and publishes main builds with `sha-<commit>`
+as well as v16/latest. The CUDA base digest and direct runtime versions are pinned;
+transitive/apt dependencies are not fully locked. Use the published digest for rollout.
+GPU inference and sample quality must still pass a real GPU smoke test before rollout.

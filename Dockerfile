@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04@sha256:ac55d124da4882b497f732d8dfd9a702d5447a5f29d08d56da6f64f0a1eb34bc
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -16,7 +16,8 @@ RUN pip3 install --index-url https://download.pytorch.org/whl/cu128 \
         torch==2.7.0 torchvision==0.22.0
 
 # spandrel replaces basicsr+realesrgan: no torchvision monkey-patch, fewer deps
-RUN pip3 install "numpy<2" spandrel boto3 runpod
+COPY requirements.txt /requirements.txt
+RUN pip3 install -r /requirements.txt
 
 # Bake all weights into the image and verify spandrel can read each architecture
 RUN mkdir -p /models \
@@ -33,6 +34,10 @@ for name, path in {
     d = ModelLoader().load_from_file(path)
     print(name, "->", d.architecture.name, "x%d" % d.scale)
 PY
+
+ARG VCS_REF=unknown
+ENV IMAGE_REVISION=$VCS_REF
+LABEL org.opencontainers.image.revision=$VCS_REF
 
 COPY handler.py /handler.py
 
