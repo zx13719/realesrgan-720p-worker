@@ -153,6 +153,7 @@ def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, 
                   half=True, channels_last=True):
     """Decode -> (prefetch) -> GPU enhance -> encode, muxing the original audio."""
     w, h, fps, duration, expected_frames, has_audio = ffprobe(src)
+    expected_frames = count_frames(src)
     out_w = int(w * outscale); out_w -= out_w % 2
     out_h = int(h * outscale); out_h -= out_h % 2
 
@@ -186,18 +187,29 @@ def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, 
     # Decode runs in a producer thread so the GPU never waits on the ffmpeg pipe.
     q = queue.Queue(maxsize=max(2, frame_batch * 2))
     producer_error = []
+    cancelled = threading.Event()
+
+    def enqueue(item):
+        while not cancelled.is_set():
+            try:
+                q.put(item, timeout=0.2)
+                return
+            except queue.Full:
+                pass
 
     def produce():
         try:
-            while True:
+            while not cancelled.is_set():
                 buf = reader.stdout.read(frame_bytes)
                 if len(buf) < frame_bytes:
+                    if buf:
+                        raise RuntimeError("decoder emitted an incomplete frame")
                     break
-                q.put(np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy())
+                enqueue(np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy())
         except Exception as e:  # noqa: BLE001
             producer_error.append(e)
         finally:
-            q.put(None)
+            enqueue(None)
 
     th = threading.Thread(target=produce, daemon=True)
     th.start()
@@ -228,15 +240,33 @@ def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, 
             if len(pending) >= frame_batch:
                 flush()
         flush()
+        reader.wait(timeout=10)
     finally:
+        cancelled.set()
+        # On GPU/encoder failure the producer can be blocked on the decoder pipe.
+        if reader.poll() is None:
+            reader.terminate()
         th.join(timeout=5)
         try:
             writer.stdin.close()
-        except Exception:
+        except (BrokenPipeError, OSError):
             pass
-        writer.wait()
+        try:
+            writer.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            writer.kill()
+            writer.wait()
+            raise RuntimeError("encoder did not exit within 60 seconds")
         reader.stdout.close()
-        reader.wait()
+        try:
+            reader.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            reader.kill()
+            reader.wait()
+    if writer.returncode:
+        raise RuntimeError(f"encoder exited with status {writer.returncode}")
+    if reader.returncode:
+        raise RuntimeError(f"decoder exited with status {reader.returncode}")
     if producer_error:
         raise producer_error[0]
 
@@ -246,6 +276,9 @@ def upscale_video(src, dst, model, outscale, scale, vcodec="auto", preset=None, 
         raise RuntimeError(
             f"frame mismatch: source={expected_frames} output={actual} "
             f"({expected_frames - actual} lost)")
+
+    subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i", dst,
+                    "-f", "null", "-"], check=True, timeout=300)
 
     return {"width": out_w, "height": out_h, "fps": fps, "duration": duration,
             "frames": frames, "verified_frames": actual,
