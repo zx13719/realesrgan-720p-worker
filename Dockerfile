@@ -5,7 +5,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
-    HF_HUB_DISABLE_TELEMETRY=1
+    HF_HUB_DISABLE_TELEMETRY=1 \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 # Ubuntu 24.04 ships Python 3.12 + ffmpeg 6.1 (much newer than 22.04's ffmpeg 4.4)
 RUN apt-get update && apt-get install -y --no-install-recommends \
