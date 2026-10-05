@@ -42,6 +42,7 @@ MODELS = {
 
 _MODELS = {}
 _NVENC = None
+_NVENC_ERROR = None
 
 
 def cuda_info():
@@ -57,7 +58,7 @@ def cuda_info():
 
 def nvenc_available():
     """Probe once whether this build/driver exposes h264_nvenc."""
-    global _NVENC
+    global _NVENC, _NVENC_ERROR
     if _NVENC is None:
         try:
             r = subprocess.run(
@@ -67,9 +68,21 @@ def nvenc_available():
                 capture_output=True, timeout=40,
             )
             _NVENC = (r.returncode == 0)
-        except Exception:
+            _NVENC_ERROR = None if _NVENC else r.stderr.decode(errors="replace")[-800:]
+        except Exception as exc:
             _NVENC = False
+            _NVENC_ERROR = f"{type(exc).__name__}: {exc}"[:800]
     return _NVENC
+
+
+def codec_info():
+    """A real encode probe, not merely a compiled-in encoder listing."""
+    available = nvenc_available()
+    return {
+        "nvenc_available": available,
+        "nvenc_error": _NVENC_ERROR,
+        "driver_capabilities": os.environ.get("NVIDIA_DRIVER_CAPABILITIES"),
+    }
 
 
 def get_model(name, half=True, channels_last=True, compile_model=False):
@@ -320,6 +333,9 @@ def s3_client():
 
 def handler(event):
     inp = event.get("input") or {}
+    if inp.get("operation") == "diagnostics":
+        return {"runtime": cuda_info(), "codecs": codec_info(),
+                "revision": os.environ.get("IMAGE_REVISION", "unknown")}
     videos = inp.get("videos") or []
     if not videos:
         return {"error": "no videos provided"}
@@ -395,6 +411,7 @@ def handler(event):
         "frame_batch": frame_batch,
         "channels_last": channels_last,
         "runtime": info,
+        "codecs": codec_info(),
         "model_load_time": load_time,
         "results": results,
     }

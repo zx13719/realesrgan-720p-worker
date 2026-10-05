@@ -71,3 +71,18 @@ builds PR images without publishing, and publishes main builds with `sha-<commit
 as well as v16/latest. The CUDA base digest and direct runtime versions are pinned;
 transitive/apt dependencies are not fully locked. Use the published digest for rollout.
 GPU inference and sample quality must still pass a real GPU smoke test before rollout.
+
+### Video driver access and diagnostics
+
+The container requests `NVIDIA_DRIVER_CAPABILITIES=compute,utility,video`.
+CUDA inference alone only needs compute; NVENC also needs the video driver
+libraries injected when the worker starts. Endpoint/template environment overrides
+must retain all three capabilities. Existing workers may need a fresh rollout.
+
+`{"input":{"operation":"diagnostics"}}` probes a real short NVENC encode without
+loading ESR weights or reading/writing R2. Normal responses also include `codecs`
+with availability, the bounded probe error and requested driver capabilities.
+`auto` still falls back to x264 if the actual host cannot encode; `nvenc` can be
+used for an explicit acceptance test. NVDEC is not enabled by this change: the
+current pipeline consumes CPU BGR frames and needs a measured decode/transfer
+comparison before choosing GPU decoding.
